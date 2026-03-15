@@ -1,5 +1,5 @@
 /*
-    Frequency Mute v1.0.1 by AAD
+    Frequency Mute v1.0.2 by AAD
     https://github.com/AmateurAudioDude/
 */
 

@@ -1,5 +1,5 @@
 /*
-    Frequency Mute v1.0.1 by AAD
+    Frequency Mute v1.0.2 by AAD
     https://github.com/AmateurAudioDude/
 
     //// Server-side code ////
@@ -42,9 +42,12 @@ let maxManualBandwidth = 151;
 let bandwidthInterceptValue = 'W';
 let unmuteOnNoUsers = true;
 let disablePlugin = false;
+let muteDelay = 0;
 let currentStatus = 'normal'; // 'normal', 'muted', or 'attenuated'
+let currentTargetStatus = 'normal';
 let hasUsers = true;
 let isMuted = false;
+let muteDelayTimer = null;
 
 // Check if FrequencyMute.json exists
 function checkConfigFile() {
@@ -63,6 +66,7 @@ function checkConfigFile() {
                 {"freq": 88.3, "mode": "D"}
             ],
             "tolerance": 0.05,
+            "muteDelay": 0,
             "limitManualBandwidth": false,
             "maxManualBandwidth": 151,
             "bandwidthInterceptValue": "W",
@@ -82,6 +86,7 @@ function checkConfigFile() {
 const defaultSettings = {
     frequencies: [],
     tolerance: 0.05,
+    muteDelay: 0,
     limitManualBandwidth: false,
     maxManualBandwidth: 151,
     bandwidthInterceptValue: 'W',
@@ -114,6 +119,8 @@ function loadMutedFrequencies(isReloaded = false) {
 
         const rawFrequencies = configData.frequencies || [];
         freqTolerance = configData.tolerance || 0.05;
+        const parsedMuteDelay = Number(configData.muteDelay);
+        muteDelay = Number.isFinite(parsedMuteDelay) && parsedMuteDelay > 0 ? parsedMuteDelay : 0;
         limitManualBandwidth = configData.limitManualBandwidth || false;
         maxManualBandwidth = configData.maxManualBandwidth || 151;
         bandwidthInterceptValue = configData.bandwidthInterceptValue || 'W';
@@ -149,6 +156,8 @@ function loadMutedFrequencies(isReloaded = false) {
         logError(`${pluginName}: Failed to parse FrequencyMute.json:`, err.message);
         mutedFrequencies = [];
         freqTolerance = 0.05;
+        muteDelay = 0;
+        syncCurrentStatus('normal', true, true);
     }
 }
 
@@ -172,6 +181,8 @@ function watchFile() {
             logInfo(`${pluginName}: FrequencyMute.json deleted`);
             filePreviouslyExisted = false;
             mutedFrequencies = [];
+            muteDelay = 0;
+            syncCurrentStatus('normal', true, true);
             return;
         }
 
@@ -209,33 +220,90 @@ function getStatusFromMode(mode) {
     }
 }
 
-// Recheck current frequency
-function recheckCurrentFrequency(forceUpdate) {
-    if (disablePlugin) {
-        applyVolumeChange('normal', true);
-        sendToClient('normal', true);
-
-        return;
+function clearMuteDelayTimer() {
+    if (muteDelayTimer) {
+        clearTimeout(muteDelayTimer);
+        muteDelayTimer = null;
     }
+}
 
-    let newStatus = 'normal';
-    let matchedMode = null;
-
-    // Consider floating point precision
+function getMatchedStatusForFrequency(frequencyRounded) {
     const epsilon = 0.001;
 
     for (const freqItem of mutedFrequencies) {
-        if (Math.abs(currentFrequencyRounded - freqItem.freq) <= (freqTolerance + epsilon)) {
-            matchedMode = freqItem.mode;
-            newStatus = getStatusFromMode(matchedMode);
-            break;
+        if (Math.abs(frequencyRounded - freqItem.freq) <= (freqTolerance + epsilon)) {
+            return getStatusFromMode(freqItem.mode);
         }
     }
 
-    // Update state if it changed
-    currentStatus = newStatus;
-    applyVolumeChange(newStatus, forceUpdate);
-    sendToClient(newStatus);
+    return 'normal';
+}
+
+function setAppliedStatus(status, forceUpdate = false) {
+    currentStatus = status;
+    applyVolumeChange(status, forceUpdate);
+    sendToClient(status, forceUpdate);
+}
+
+function syncCurrentStatus(targetStatus, forceUpdate = false, restartMuteDelay = false) {
+    currentTargetStatus = targetStatus;
+
+    const effectiveStatus = (disablePlugin || (unmuteOnNoUsers && !hasUsers)) ? 'normal' : targetStatus;
+
+    if (effectiveStatus !== 'muted') {
+        clearMuteDelayTimer();
+        if (currentStatus !== effectiveStatus || forceUpdate) {
+            setAppliedStatus(effectiveStatus, forceUpdate);
+        }
+        return;
+    }
+
+    if (muteDelay <= 0) {
+        clearMuteDelayTimer();
+        if (currentStatus !== 'muted' || forceUpdate) {
+            setAppliedStatus('muted', forceUpdate);
+        }
+        return;
+    }
+
+    if (currentStatus === 'muted') {
+        clearMuteDelayTimer();
+        if (forceUpdate) {
+            setAppliedStatus('muted', true);
+        }
+        return;
+    }
+
+    if (currentStatus !== 'normal' || forceUpdate) {
+        setAppliedStatus('normal', forceUpdate);
+    }
+
+    if (!restartMuteDelay && muteDelayTimer) {
+        return;
+    }
+
+    clearMuteDelayTimer();
+    muteDelayTimer = setTimeout(() => {
+        muteDelayTimer = null;
+
+        const delayedStatus = (disablePlugin || (unmuteOnNoUsers && !hasUsers)) ? 'normal' : currentTargetStatus;
+        if (delayedStatus !== 'muted') {
+            if (currentStatus !== delayedStatus) {
+                setAppliedStatus(delayedStatus);
+            }
+            return;
+        }
+
+        if (currentStatus !== 'muted') {
+            setAppliedStatus('muted');
+        }
+    }, muteDelay * 1000);
+}
+
+// Recheck current frequency
+function recheckCurrentFrequency(forceUpdate) {
+    const newStatus = getMatchedStatusForFrequency(currentFrequencyRounded);
+    syncCurrentStatus(newStatus, forceUpdate, true);
 }
 
 // Apply volume change based on status
@@ -243,7 +311,6 @@ function applyVolumeChange(status, forceUpdate) {
     if (!forceUpdate && (disablePlugin || (unmuteOnNoUsers && !hasUsers))) return;
     if (unmuteOnNoUsers && !hasUsers && forceUpdate) {
         status = 'normal'; // Real-time update
-        sendToClient('normal', true);
     }
     if (status === 'muted') {
         // Mute
@@ -337,12 +404,7 @@ async function TextWebSocket(messageData) {
                         if (unmuteOnNoUsers) {
                             if (hasUsers !== !!messageData?.users) {
                                 hasUsers = !!messageData?.users;
-                                if (messageData?.users) {
-                                    recheckCurrentFrequency(true);
-                                } else {
-                                    applyVolumeChange('normal', true);
-                                    sendToClient('normal', true);
-                                }
+                                recheckCurrentFrequency(true);
                             }
                         }
                         //console.log(messageData);
@@ -470,26 +532,12 @@ function waitForServer() {
             //logInfo("Frequency:", currentFrequencyRounded);
 
             if (currentFrequencyRounded !== previousFrequencyRounded) {
-                // Check if current frequency matches any frequency in the list
-                let newStatus = 'normal';
-                let matchedMode = null;
+                const newStatus = getMatchedStatusForFrequency(currentFrequencyRounded);
+                const shouldRestartMuteDelay = newStatus === 'muted' && currentTargetStatus !== 'muted';
+                const statusChanged = newStatus !== currentTargetStatus;
 
-                // Consider floating point precision
-                const epsilon = 0.001;
-
-                for (const freqItem of mutedFrequencies) {
-                    if (Math.abs(currentFrequencyRounded - freqItem.freq) <= (freqTolerance + epsilon)) {
-                        matchedMode = freqItem.mode;
-                        newStatus = getStatusFromMode(matchedMode);
-                        break;
-                    }
-                }
-
-                // Only change state if it's different from current state
-                if (newStatus !== currentStatus) {
-                    currentStatus = newStatus;
-                    applyVolumeChange(newStatus);
-                    sendToClient(newStatus);
+                if (statusChanged || shouldRestartMuteDelay || muteDelayTimer) {
+                    syncCurrentStatus(newStatus, false, shouldRestartMuteDelay);
                 }
 
                 previousFrequencyRounded = currentFrequencyRounded;
