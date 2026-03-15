@@ -1,5 +1,5 @@
 /*
-    Frequency Mute v1.0.0 by AAD
+    Frequency Mute v1.0.1 by AAD
     https://github.com/AmateurAudioDude/
 
     //// Server-side code ////
@@ -40,8 +40,10 @@ let freqTolerance = 0.05;
 let limitManualBandwidth = false;
 let maxManualBandwidth = 151;
 let bandwidthInterceptValue = 'W';
+let unmuteOnNoUsers = true;
 let disablePlugin = false;
 let currentStatus = 'normal'; // 'normal', 'muted', or 'attenuated'
+let hasUsers = true;
 let isMuted = false;
 
 // Check if FrequencyMute.json exists
@@ -64,6 +66,7 @@ function checkConfigFile() {
             "limitManualBandwidth": false,
             "maxManualBandwidth": 151,
             "bandwidthInterceptValue": "W",
+            "unmuteOnNoUsers": true,
             "disablePlugin": false
         };
 
@@ -82,6 +85,7 @@ const defaultSettings = {
     limitManualBandwidth: false,
     maxManualBandwidth: 151,
     bandwidthInterceptValue: 'W',
+    unmuteOnNoUsers: true,
     disablePlugin: false
 };
 
@@ -113,6 +117,7 @@ function loadMutedFrequencies(isReloaded = false) {
         limitManualBandwidth = configData.limitManualBandwidth || false;
         maxManualBandwidth = configData.maxManualBandwidth || 151;
         bandwidthInterceptValue = configData.bandwidthInterceptValue || 'W';
+        unmuteOnNoUsers = configData.unmuteOnNoUsers || false;
         disablePlugin = configData.disablePlugin || false;
 
         // Parse frequencies
@@ -138,7 +143,7 @@ function loadMutedFrequencies(isReloaded = false) {
 
         // Check current frequency against new list on reload
         if (isReloaded && currentFrequencyRounded > 0) {
-            recheckCurrentFrequency();
+            recheckCurrentFrequency(true);
         }
     } catch (err) {
         logError(`${pluginName}: Failed to parse FrequencyMute.json:`, err.message);
@@ -181,6 +186,7 @@ function watchFile() {
 
 // Send status to client
 function sendToClient(status, forceUpdate) {
+    if (!forceUpdate && (disablePlugin || (unmuteOnNoUsers && !hasUsers))) return;
     if ((!disablePlugin || forceUpdate) && (extraSocket && extraSocket.readyState === WebSocket.OPEN)) {
         extraSocket.send(JSON.stringify({
             type: 'frequency-mute',
@@ -204,7 +210,7 @@ function getStatusFromMode(mode) {
 }
 
 // Recheck current frequency
-function recheckCurrentFrequency() {
+function recheckCurrentFrequency(forceUpdate) {
     if (disablePlugin) {
         applyVolumeChange('normal', true);
         sendToClient('normal', true);
@@ -228,13 +234,17 @@ function recheckCurrentFrequency() {
 
     // Update state if it changed
     currentStatus = newStatus;
-    applyVolumeChange(newStatus);
+    applyVolumeChange(newStatus, forceUpdate);
     sendToClient(newStatus);
 }
 
 // Apply volume change based on status
 function applyVolumeChange(status, forceUpdate) {
-    if (disablePlugin && !forceUpdate) return;
+    if (!forceUpdate && (disablePlugin || (unmuteOnNoUsers && !hasUsers))) return;
+    if (unmuteOnNoUsers && !hasUsers && forceUpdate) {
+        status = 'normal'; // Real-time update
+        sendToClient('normal', true);
+    }
     if (status === 'muted') {
         // Mute
         sendCommandToClient('Y' + (0) + '\n');
@@ -324,6 +334,17 @@ async function TextWebSocket(messageData) {
                     try {
                         // Parse incoming message data
                         const messageData = JSON.parse(event.data);
+                        if (unmuteOnNoUsers) {
+                            if (hasUsers !== !!messageData?.users) {
+                                hasUsers = !!messageData?.users;
+                                if (messageData?.users) {
+                                    recheckCurrentFrequency(true);
+                                } else {
+                                    applyVolumeChange('normal', true);
+                                    sendToClient('normal', true);
+                                }
+                            }
+                        }
                         //console.log(messageData);
 
                         checkSerialportStatus();
